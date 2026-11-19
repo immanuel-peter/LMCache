@@ -936,3 +936,54 @@ def test_subpaged_plane_rules_are_ordered_and_exclusive(edits):
         ]
         expected = contiguous if contiguous_layout else interleaved
         assert matches == [expected]
+
+
+# --------------------------------------------------------------------------
+# vllm-torchtpu: every group pooled in the packed [NB, BS, NHP, P, HS] layout
+# --------------------------------------------------------------------------
+
+
+def _packed_pool_hybrid() -> tuple[_Config, dict[str, _RegisteredKVCache]]:
+    """A hybrid as vllm-torchtpu registers it: the recurrent state fills one
+    attention slot, so both groups share one packed layout and the state
+    arrives as a single-tensor list."""
+    block_size = 8
+    shape = (NUM_LOGICAL_BLOCKS, block_size, 4, 2, HEAD_SIZE)
+    page_bytes = block_size * 4 * 2 * HEAD_SIZE * 2
+    groups = [
+        _Group(
+            layer_names=["gdn.0"],
+            kv_cache_spec=_Spec(_SpecKind.MAMBA, block_size, page_bytes),
+        ),
+        _Group(
+            layer_names=["attn.0"],
+            kv_cache_spec=_Spec(_SpecKind.FULL_ATTENTION, block_size, page_bytes),
+        ),
+    ]
+    kv_caches: dict[str, _RegisteredKVCache] = {
+        "gdn.0": [torch.zeros(shape, dtype=torch.bfloat16)],
+        "attn.0": torch.zeros(shape, dtype=torch.bfloat16),
+    }
+    return _Config(kv_cache_groups=groups), kv_caches
+
+
+def test_packed_pool_hybrid_registers_the_tensors_as_they_are(edits):
+    """The pooled state is unwrapped and the attention tensor is not re-paged:
+    each row of either is already one scheduler block."""
+    config, kv_caches = _packed_pool_hybrid()
+    state = kv_caches["gdn.0"][0]
+
+    edited = edits.apply_kv_cache_group_edits(config, kv_caches, layout_hints={})
+
+    assert edited["gdn.0"] is state
+    assert edited["attn.0"] is kv_caches["attn.0"]
+
+
+def test_packed_pool_rule_skips_a_state_paged_at_another_block_size(edits):
+    """A single state tensor whose rows are not scheduler blocks is not the
+    packed pool, so the rule must leave it to the other Mamba rules."""
+    config, kv_caches = _packed_pool_hybrid()
+    spec = config.kv_cache_groups[0].kv_cache_spec
+    spec.block_size *= 2
+
+    assert not edits._MambaPackedPoolEdit().matches(spec, kv_caches["gdn.0"])

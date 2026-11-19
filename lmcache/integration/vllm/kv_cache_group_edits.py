@@ -293,6 +293,61 @@ class KVCacheGroupEdit(ABC):
         """
 
 
+def _is_block_row_packed(spec: KVCacheSpec, kv_cache: object) -> bool:
+    """Whether ``kv_cache`` is one ``[NB, BS, NHP, P, HS]`` tensor whose rows
+    are already whole scheduler blocks (the vllm-torchtpu packed layout)."""
+    return (
+        isinstance(kv_cache, torch.Tensor)
+        and kv_cache.ndim == 5
+        and kv_cache.shape[1] == spec.block_size
+    )
+
+
+class _MambaPackedPoolEdit(KVCacheGroupEdit):
+    """Unwrap a recurrent state pooled in the packed attention layout.
+
+    vllm-torchtpu sizes the scheduler block so one recurrent state fills one
+    attention slot, and registers each Mamba / Gated DeltaNet layer as a
+    single-tensor list ``[state]`` shaped ``[NB, BS, NHP, P, HS]`` -- the
+    layout its attention layers use. Each row is already one opaque page per
+    block, so the transfer path needs the bare tensor and no re-view.
+    """
+
+    name = "mamba-packed-pool"
+
+    def matches(
+        self,
+        spec: KVCacheSpec,
+        kv_cache: RegisteredKVCache,
+        kind: KVCacheSpecKind | None = None,
+    ) -> bool:
+        return (
+            _spec_kind(spec, kind) == KVCacheSpecKind.MAMBA
+            and isinstance(kv_cache, list)
+            and len(kv_cache) == 1
+            and _is_block_row_packed(spec, kv_cache[0])
+        )
+
+    def apply(
+        self,
+        spec: KVCacheSpec,
+        kv_cache: RegisteredKVCache,
+        _layout_hints: LayoutHints,
+    ) -> torch.Tensor:
+        """Return the pooled state tensor itself.
+
+        Raises:
+            ValueError: If ``kv_cache`` is not a single-tensor list in the
+                packed block-row layout.
+        """
+        if not self.matches(spec, kv_cache, KVCacheSpecKind.MAMBA):
+            raise ValueError(
+                "expected a single [NB, BS, NHP, P, HS] recurrent state tensor "
+                f"with BS == {spec.block_size}"
+            )
+        return kv_cache[0]
+
+
 class _MambaPageViewEdit(KVCacheGroupEdit):
     """Convert a Mamba page to its equivalent: a sliding-window-style layer.
 
@@ -512,6 +567,9 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
             and isinstance(kv_cache, torch.Tensor)
             and kv_cache.ndim in (5, 4)
             and kv_cache.shape[2] != spec.block_size
+            # The packed [NB, BS, NHP, P, HS] layout is paged at the scheduler
+            # block already; its dim 2 is a head count, not a kernel block.
+            and not _is_block_row_packed(spec, kv_cache)
         )
 
     def apply(
@@ -1137,6 +1195,7 @@ class _SubpagedAttentionContiguousPlaneViewEdit(KVCacheGroupEdit):
 
 # Rule registry, in match priority order.
 _EDITS: tuple[KVCacheGroupEdit, ...] = (
+    _MambaPackedPoolEdit(),
     _MambaUnifiedViewEdit(),
     _MambaPageViewEdit(),
     _MambaSlicePlaneEdit(),
