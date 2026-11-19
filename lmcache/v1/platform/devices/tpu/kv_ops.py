@@ -7,6 +7,10 @@ store, ``.to(device)`` + ``index_put_`` to retrieve. TorchTPU compiles one
 program per operand shape, so the block index is padded to the next power of
 two by repeating its last block; the extra rows are dropped on store and
 rewrite that block with its own bytes on retrieve.
+
+The round trip is bit-exact for every finite normal value, zero and infinity.
+TorchTPU's gather and scatter canonicalize NaN payloads and flush bf16
+subnormals to zero, so those bit patterns do not survive.
 """
 
 # Future

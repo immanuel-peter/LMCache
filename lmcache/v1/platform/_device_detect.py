@@ -174,7 +174,7 @@ def _resolve_explicit_backend(
             "available on this host."
         )
 
-    torch_module = getattr(torch, spec.torch_module_name, None)
+    torch_module = spec.resolve_torch_module(torch)
     if torch_module is None:
         raise RuntimeError(
             f"{DEVICE_BACKEND_ENV_VAR}={backend_name!r} resolved to "
@@ -198,7 +198,7 @@ def _resolve_device_type_candidates(
         if not spec.is_available():
             continue
 
-        torch_module = getattr(torch, spec.torch_module_name, None)
+        torch_module = spec.resolve_torch_module(torch)
         if torch_module is None:
             logger.warning(
                 "backend [%s] for device [%s] is available, but torch module "

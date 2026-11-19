@@ -222,7 +222,12 @@ def synchronize_device(device: torch.device) -> None:
     import torch
 
     spec = _resolve_device_spec(device.type)
-    getattr(torch, spec.torch_module_name).synchronize(device)
+    torch_module = spec.resolve_torch_module(torch)
+    if torch_module is None:
+        raise AttributeError(
+            f"torch has no device module for backend {spec.backend_name!r}"
+        )
+    torch_module.synchronize(device)
 
 
 torch_dev, torch_device_type = get_torch_device()

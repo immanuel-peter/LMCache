@@ -14,7 +14,7 @@ import threading
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.client.transfer_context.base import (
     ContextClosedError,
@@ -70,7 +70,8 @@ def _supports_async_primitives() -> bool:
     """Probe whether the worker device supports the async store primitives.
 
     The async engine-driven store path needs a stream, an event exposing
-    ``record``/``synchronize``/``wait``, and pinned (page-locked) host memory.
+    ``record``/``synchronize``/``wait``, pinned (page-locked) host memory, and
+    a device whose KV tensors can be read while the engine runs a step.
     When any of these is unavailable (e.g. a CPU-only backend), the factory
     falls back to the synchronous :class:`EngineDrivenTransferContext`. This
     dispatch is internal and capability-based; there is no user-facing
@@ -79,6 +80,12 @@ def _supports_async_primitives() -> bool:
     Returns:
         True if all required async primitives are available, else False.
     """
+    device_spec = get_device_spec(torch_device_type)
+    if (
+        device_spec is not None
+        and not device_spec.is_async_engine_driven_store_available()
+    ):
+        return False
     if not hasattr(torch_dev, "Stream") or not hasattr(torch_dev, "Event"):
         return False
     # CPU-only stub exposes Stream/Event but has no real async capability.

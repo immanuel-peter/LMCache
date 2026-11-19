@@ -20,6 +20,7 @@ from lmcache import torch_device_type
 from lmcache.utils import EngineType
 from lmcache.v1.common.kv_format import detect_format, extract_kv_cache_shapes
 from lmcache.v1.common.kv_format.detectors import vllm as vllm_detector
+from lmcache.v1.common.kv_format.types import LayoutHints
 import lmcache.lmcache_native as lmcache_native
 
 NB, NL, BS, NH, HS = 7, 5, 3, 2, 4
@@ -40,9 +41,10 @@ def test_vllm_cross_layer():
 
 
 # The CPU-HND safeguard forces HND regardless of hint when running on a CPU
-# host; bypass it so the hint-driven NHD/HND branch is exercised on any host.
+# host, and a TPU host reads every per-layer 5-D cache as the packed layout;
+# bypass both so the hint-driven NHD/HND branch is exercised on any host.
 _VLLM_DEV = "lmcache.v1.common.kv_format.detectors.vllm.torch_device_type"
-_MOCK_DEVICE_TYPE = "cuda" if torch_device_type == "cpu" else torch_device_type
+_MOCK_DEVICE_TYPE = "cuda" if torch_device_type in ("cpu", "tpu") else torch_device_type
 
 
 def test_vllm_flash_attn_hnd(monkeypatch):

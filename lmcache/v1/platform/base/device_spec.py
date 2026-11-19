@@ -99,6 +99,22 @@ class DeviceSpec:
         """
         return ""
 
+    def resolve_torch_module(self, torch: Any) -> Any | None:
+        """Return the device module LMCache's ``torch_dev`` call sites use.
+
+        The base returns ``getattr(torch, self.torch_module_name)``. A backend
+        overrides this when code outside PyTorch may not call that module's
+        functions directly and LMCache needs an adapter in front of it.
+
+        Args:
+            torch: The imported ``torch`` package.
+
+        Returns:
+            Any | None: The device module, or ``None`` when ``torch`` has no
+            attribute named :attr:`torch_module_name`.
+        """
+        return getattr(torch, self.torch_module_name, None)
+
     @property
     def ops_cls(self) -> type[DeviceOps]:
         """DeviceOps subclass providing this platform's operation surface.
@@ -152,6 +168,20 @@ class DeviceSpec:
         probe (MUSA).
         """
         return False
+
+    def is_async_engine_driven_store_available(self) -> bool:
+        """Whether engine-driven stores may gather off the engine's thread.
+
+        The async store path reads the engine's KV tensors from a background
+        thread while the engine keeps running forward steps. The base returns
+        ``True``; a backend returns ``False`` when its KV tensors cannot be
+        read concurrently with a step, and the worker then gathers
+        synchronously on the engine's thread.
+
+        Returns:
+            bool: ``True`` when concurrent reads of the KV tensors are safe.
+        """
+        return True
 
     def default_mp_transfer_mode(self) -> MPTransferMode:
         """Default MP transfer mode when neither the caller nor

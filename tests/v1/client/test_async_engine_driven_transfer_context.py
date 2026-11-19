@@ -370,6 +370,17 @@ def test_supports_async_primitives_false_without_stream(
     assert worker_transfer._supports_async_primitives() is False
 
 
+def test_supports_async_primitives_false_when_the_device_declines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device whose KV tensors cannot be read during a forward step gets the
+    synchronous store path even when stream and event primitives exist."""
+    monkeypatch.setattr(worker_transfer, "torch_dev", _FakeTorchDev(threading.Event()))
+    spec = SimpleNamespace(is_async_engine_driven_store_available=lambda: False)
+    monkeypatch.setattr(worker_transfer, "get_device_spec", lambda _type: spec)
+    assert worker_transfer._supports_async_primitives() is False
+
+
 def test_flush_inflight_stores_waits_for_pending_gather(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

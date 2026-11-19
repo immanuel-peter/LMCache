@@ -29,59 +29,46 @@ if TYPE_CHECKING:
     from lmcache.v1.platform.base.device_ops import DeviceOps
 
 
-def _tpu_is_available() -> bool:
-    """``torch.tpu.is_available()`` through ``torch.accelerator``."""
-    return torch.accelerator.is_available()
+class _TpuDeviceModule:
+    """``torch.tpu`` as LMCache's generic ``torch_dev`` call sites need it.
 
-
-def _tpu_device_count() -> int:
-    """``torch.tpu.device_count()`` through ``torch.accelerator``."""
-    return torch.accelerator.device_count()
-
-
-def _tpu_synchronize(device: int | str | torch.device | None = None) -> None:
-    """``torch.tpu.synchronize()`` through ``torch.accelerator``."""
-    torch.accelerator.synchronize(device)
-
-
-def _tpu_current_device() -> int:
-    """``torch.tpu.current_device()`` through ``torch.accelerator``."""
-    return torch.accelerator.current_device_index()
-
-
-def _tpu_set_device(device: int | str | torch.device) -> None:
-    """``torch.tpu.set_device()`` through ``torch.accelerator``."""
-    torch.accelerator.set_device_index(device)
-
-
-def _tpu_current_stream(
-    device: int | str | torch.device | None = None,
-) -> torch.Stream:
-    """``torch.tpu.current_stream()`` through ``torch.accelerator``."""
-    return torch.accelerator.current_stream(device)
-
-
-# On PyTorch >= 2.11 TorchTPU raises RuntimeError when code outside torch calls
-# these on ``torch.tpu`` and points to ``torch.accelerator``, which reaches the
-# same ``TpuDeviceGuardImpl``; so unlike Neuron's shims, these replace the
-# module's own functions.
-_DEVICE_MODULE_SHIMS = {
-    "is_available": _tpu_is_available,
-    "device_count": _tpu_device_count,
-    "synchronize": _tpu_synchronize,
-    "current_device": _tpu_current_device,
-    "set_device": _tpu_set_device,
-    "current_stream": _tpu_current_stream,
-}
-
-
-def _install_device_module_shims(torch_tpu_module: Any) -> None:
-    """Point ``torch.tpu``'s restricted functions at ``torch.accelerator``.
-
-    Idempotent: installing again sets the same functions.
+    On PyTorch >= 2.11 TorchTPU raises ``RuntimeError`` when code outside torch
+    calls the device-module functions below and points to ``torch.accelerator``.
+    They cannot be replaced on ``torch.tpu`` itself:
+    ``torch.accelerator.is_available`` and ``device_count`` delegate back to the
+    device module, so a replacement that calls them recurses. This adapter
+    leaves ``torch.tpu`` as TorchTPU installed it and forwards every other
+    attribute to it.
     """
-    for name, impl in _DEVICE_MODULE_SHIMS.items():
-        setattr(torch_tpu_module, name, impl)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(torch.tpu, name)  # type: ignore[attr-defined]
+
+    def is_available(self) -> bool:
+        """``torch.tpu.is_available()`` through ``torch.accelerator``."""
+        return torch.accelerator.is_available()
+
+    def device_count(self) -> int:
+        """``torch.tpu.device_count()`` through ``torch.accelerator``."""
+        return torch.accelerator.device_count()
+
+    def synchronize(self, device: int | str | torch.device | None = None) -> None:
+        """``torch.tpu.synchronize()`` through ``torch.accelerator``."""
+        torch.accelerator.synchronize(device)
+
+    def current_device(self) -> int:
+        """``torch.tpu.current_device()`` through ``torch.accelerator``."""
+        return torch.accelerator.current_device_index()
+
+    def set_device(self, device: int | str | torch.device) -> None:
+        """``torch.tpu.set_device()`` through ``torch.accelerator``."""
+        torch.accelerator.set_device_index(device)
+
+    def current_stream(
+        self, device: int | str | torch.device | None = None
+    ) -> torch.Stream:
+        """``torch.tpu.current_stream()`` through ``torch.accelerator``."""
+        return torch.accelerator.current_stream(device)
 
 
 class TpuDeviceSpec(DeviceSpec):
@@ -110,10 +97,7 @@ class TpuDeviceSpec(DeviceSpec):
         is then read through ``torch.accelerator`` rather than
         ``torch.tpu.is_available()``: on PyTorch >= 2.11 TorchTPU reserves the
         ``torch.tpu`` device-module functions for the framework and raises
-        ``RuntimeError`` when other packages call them. Once a TPU is found,
-        also points those ``torch.tpu`` functions at ``torch.accelerator``, so
-        that the generic ``torch_dev.<method>()`` call sites throughout LMCache
-        work on TPU without each one needing a TPU-specific branch.
+        ``RuntimeError`` when other packages call them.
 
         Returns:
             bool: ``True`` when ``torch_tpu`` imports and the current
@@ -126,10 +110,38 @@ class TpuDeviceSpec(DeviceSpec):
             return False
 
         accelerator = torch.accelerator.current_accelerator(check_available=True)
-        if accelerator is None or accelerator.type != "tpu":
-            return False
-        _install_device_module_shims(torch.tpu)  # type: ignore[attr-defined]
-        return True
+        return accelerator is not None and accelerator.type == "tpu"
+
+    def resolve_torch_module(self, torch: Any) -> Any | None:
+        """Return an adapter over ``torch.tpu`` instead of the module itself.
+
+        The adapter routes the functions TorchTPU reserves for the framework
+        through ``torch.accelerator``, so the generic ``torch_dev.<method>()``
+        call sites throughout LMCache work on TPU without a TPU-specific
+        branch.
+
+        Args:
+            torch: The imported ``torch`` package.
+
+        Returns:
+            Any | None: The adapter, or ``None`` when ``torch.tpu`` is not
+            registered.
+        """
+        if getattr(torch, "tpu", None) is None:
+            return None
+        return _TpuDeviceModule()
+
+    def is_async_engine_driven_store_available(self) -> bool:
+        """Report that TorchTPU KV tensors cannot be gathered off-thread.
+
+        vllm-torchtpu donates the KV buffers to each compiled forward step, so
+        a gather racing a step fails with ``Buffer has been deleted or
+        donated``.
+
+        Returns:
+            bool: Always ``False``.
+        """
+        return False
 
     def is_lmcache_driven_available(self) -> bool:
         """Report that TorchTPU cannot serve the LMCache-driven path.

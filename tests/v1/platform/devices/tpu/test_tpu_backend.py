@@ -15,8 +15,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
-from lmcache.v1.platform import resolve_device_ops
+from lmcache.v1.platform import resolve_device_ops, synchronize_device
 from lmcache.v1.platform._device_detect import (
     DEVICE_BACKEND_ENV_VAR,
     get_device_spec,
@@ -25,6 +24,7 @@ from lmcache.v1.platform._device_detect import (
 from lmcache.v1.platform.devices.tpu import TpuDeviceSpec
 from lmcache.v1.platform.devices.tpu.device_ops import TpuDeviceOps
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
+from lmcache.v1.platform.transfer_mode import MPTransferMode
 import lmcache.lmcache_native as lmcache_native
 
 TransferDirection = lmcache_native.TransferDirection
@@ -134,7 +134,19 @@ def test_available_without_the_internal_torch_tpu_api(
     assert _is_available_with(monkeypatch, tpu, ModuleType("torch_tpu")) is True
 
 
-# -- torch.tpu shims -------------------------------------------------------
+# -- torch_dev adapter -----------------------------------------------------
+
+
+def _detected_torch_dev(monkeypatch: pytest.MonkeyPatch) -> object:
+    """Return the ``torch_dev`` LMCache detects with the TPU backend forced."""
+    monkeypatch.setenv(DEVICE_BACKEND_ENV_VAR, "tpu")
+    get_torch_device.cache_clear()
+    try:
+        torch_dev, device_type = get_torch_device()
+    finally:
+        get_torch_device.cache_clear()
+    assert device_type == "tpu"
+    return torch_dev
 
 
 def test_detected_device_module_reaches_torch_accelerator(
@@ -143,49 +155,51 @@ def test_detected_device_module_reaches_torch_accelerator(
     """LMCache's generic ``torch_dev`` calls work against strict TorchTPU."""
     accelerator = _strict_torch_tpu(monkeypatch)
     accelerator.device_count.return_value = 4
-    monkeypatch.setenv(DEVICE_BACKEND_ENV_VAR, "tpu")
-    get_torch_device.cache_clear()
-    try:
-        torch_dev, device_type = get_torch_device()
-    finally:
-        get_torch_device.cache_clear()
+    torch_dev = _detected_torch_dev(monkeypatch)
 
-    assert device_type == "tpu"
+    assert torch_dev.is_available() is accelerator.is_available.return_value
+    assert torch_dev.device_count() == 4
     torch_dev.synchronize(device=1)
     accelerator.synchronize.assert_called_once_with(1)
-    assert torch_dev.device_count() == 4
+    assert torch_dev.current_device() is accelerator.current_device_index.return_value
+    torch_dev.set_device(1)
+    accelerator.set_device_index.assert_called_once_with(1)
     assert torch_dev.current_stream() is accelerator.current_stream.return_value
     accelerator.current_stream.assert_called_once_with(None)
 
 
-def test_installing_the_shims_twice_is_harmless(
+def test_detected_device_module_forwards_everything_else(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    accelerator = _strict_torch_tpu(monkeypatch)
-    spec = TpuDeviceSpec()
-    assert spec.is_available() is True
-    assert spec.is_available() is True
+    _strict_torch_tpu(monkeypatch)
+    stream_cls = object()
+    monkeypatch.setattr(torch.tpu, "Stream", stream_cls, raising=False)
 
-    torch.tpu.is_available()
-    torch.tpu.current_device()
-    torch.tpu.set_device(1)
-    torch.tpu.synchronize()
-
-    accelerator.is_available.assert_called_once_with()
-    accelerator.current_device_index.assert_called_once_with()
-    accelerator.set_device_index.assert_called_once_with(1)
-    accelerator.synchronize.assert_called_once_with(None)
+    assert _detected_torch_dev(monkeypatch).Stream is stream_cls
 
 
-def test_shims_are_not_installed_without_a_tpu_accelerator(
+def test_synchronize_device_reaches_torch_accelerator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The store path's device sync works against strict TorchTPU."""
     accelerator = _strict_torch_tpu(monkeypatch)
-    accelerator.current_accelerator.return_value = SimpleNamespace(type="cuda")
+    device = SimpleNamespace(type="tpu", index=0)
 
-    assert TpuDeviceSpec().is_available() is False
-    with pytest.raises(RuntimeError, match="internal to TorchTPU"):
-        torch.tpu.synchronize()
+    synchronize_device(device)  # type: ignore[arg-type]
+
+    accelerator.synchronize.assert_called_once_with(device)
+
+
+def test_torch_tpu_itself_is_left_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``torch.accelerator`` delegates ``is_available`` and ``device_count``
+    back to ``torch.tpu``, so replacing those functions would recurse."""
+    _strict_torch_tpu(monkeypatch)
+    _detected_torch_dev(monkeypatch)
+
+    for name in INTERNAL_DEVICE_APIS:
+        assert getattr(torch.tpu, name) is _internal_api
 
 
 # -- Engine-driven only ----------------------------------------------------
@@ -194,6 +208,7 @@ def test_shims_are_not_installed_without_a_tpu_accelerator(
 def test_tpu_is_engine_driven_only() -> None:
     spec = TpuDeviceSpec()
     assert spec.is_lmcache_driven_available() is False
+    assert spec.is_async_engine_driven_store_available() is False
     assert spec.default_mp_transfer_mode() is MPTransferMode.ENGINE_DRIVEN
     assert spec.ipc_wrapper_cls is None
     assert spec.event_ipc_backend is None
@@ -210,10 +225,11 @@ def test_round_trip_on_device_compiles_once_per_bucket() -> None:
     if not TpuDeviceSpec().is_available():
         pytest.skip("no TorchTPU device")
     generator = torch.Generator().manual_seed(3)
-    shape = (NUM_BLOCKS, BLOCK_SIZE, NHP, P, HS * DTYPE.itemsize)
+    shape = (NUM_BLOCKS, BLOCK_SIZE, NHP, P, HS)
+    # Finite normal values, as a KV cache holds: TorchTPU's gather and scatter
+    # canonicalize NaN payloads and flush bf16 subnormals to zero.
     host = [
-        torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator).view(DTYPE)
-        for _ in range(NUM_LAYERS)
+        torch.randn(shape, generator=generator).to(DTYPE) for _ in range(NUM_LAYERS)
     ]
     device = [t.to("tpu") for t in host]
 
@@ -253,3 +269,23 @@ def test_round_trip_on_device_compiles_once_per_bucket() -> None:
     assert torch.tpu._get_cache_misses() == misses
     round_trip(9)
     assert torch.tpu._get_cache_misses() > misses
+
+
+@pytest.mark.tpu
+def test_detected_device_module_works_on_torchtpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generic ``torch_dev`` calls LMCache makes succeed on real TorchTPU,
+    where ``torch.accelerator`` delegates part of them back to ``torch.tpu``."""
+    if not TpuDeviceSpec().is_available():
+        pytest.skip("no TorchTPU device")
+    torch_dev = _detected_torch_dev(monkeypatch)
+
+    assert torch_dev.is_available() is True
+    assert torch_dev.device_count() >= 1
+    torch_dev.set_device(torch_dev.current_device())
+    stream = torch_dev.current_stream()
+    with torch_dev.stream(stream):
+        doubled = torch.arange(4, device="tpu") * 2
+    torch_dev.synchronize()
+    assert doubled.cpu().tolist() == [0, 2, 4, 6]
